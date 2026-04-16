@@ -561,6 +561,10 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Load Model
           </button>
+          <button class="btn-secondary" id="btn-download-all" onclick="handleDownloadAllModels()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 20h16"/></svg>
+            Download All Models
+          </button>
           <button class="btn-secondary" id="btn-start" onclick="handleStart()" disabled>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="3"/><path fill="none" stroke="currentColor" stroke-width="2" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
             Start Dictating
@@ -759,6 +763,7 @@ let transcriptionChain = Promise.resolve();
 let utteranceCount = 0;
 let wordCount = 0;
 let lastLatency = null;
+let isBulkDownloading = false;
 const transcriptEl = document.getElementById('transcript');
 
 function isSecureEnough() {
@@ -766,10 +771,70 @@ function isSecureEnough() {
 }
 
 function setControlsState({ loading = false, ready = false, listening = false } = {}) {
-  document.getElementById('btn-load').disabled = loading;
+  const busy = loading || isBulkDownloading;
+  document.getElementById('btn-load').disabled = busy;
+  document.getElementById('btn-download-all').disabled = busy || listening;
   document.getElementById('btn-start').disabled = !ready || listening || loading;
   document.getElementById('btn-stop').disabled = !listening;
   document.getElementById('btn-copy').disabled = !transcriptEl.textContent.trim();
+}
+
+function getSelectedModelId() {
+  return document.getElementById('model-select').value;
+}
+
+function getAllModelIds() {
+  const values = Array.from(document.querySelectorAll('#model-select option')).map((opt) => opt.value);
+  return Array.from(new Set(values));
+}
+
+function updateProgress(pct, msg) {
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('progress-text').textContent = msg;
+}
+
+async function configureTransformersEnv() {
+  const { env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js');
+  env.allowLocalModels = false;
+  env.remoteModelPath = 'https://huggingface.co/';
+
+  // Pin ONNX WASM assets to a known-good version to avoid stale CDN path 404s.
+  const onnxBackend = env.backends?.onnx || {};
+  const onnxWasm = onnxBackend.wasm || {};
+  onnxWasm.proxy = false;
+  onnxWasm.numThreads = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)
+    ? Math.min(4, navigator.hardwareConcurrency || 2)
+    : 1;
+  onnxWasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  onnxBackend.wasm = onnxWasm;
+  env.backends = env.backends || {};
+  env.backends.onnx = onnxBackend;
+}
+
+async function resolveInferenceDevice() {
+  let device = 'wasm';
+  try {
+    const testCtx = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+    if (testCtx) {
+      device = 'webgpu';
+      privLog('local', '✅ WebGPU detected — GPU-accelerated inference enabled');
+    } else {
+      privLog('info', 'ℹ️ WebGPU not available — using WASM CPU inference (slower but works everywhere)');
+    }
+  } catch (e) {
+    privLog('info', 'ℹ️ Using WASM CPU inference');
+  }
+  return device;
+}
+
+async function loadAsrPipeline(modelId, device, onProgress) {
+  return pipeline('automatic-speech-recognition', modelId, {
+    device,
+    progress_callback: (prog) => {
+      if (typeof onProgress !== 'function') return;
+      onProgress(prog);
+    }
+  });
 }
 
 // ── Privacy Log ────────────────────────────────────────────────────────
@@ -880,53 +945,19 @@ window.handleLoadModel = async function() {
   privLog('local', '🚫 Zero audio bytes will be sent over the network');
 
   try {
-    // Progress tracking via env config
-    const { env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js');
-    env.allowLocalModels = false;
-    env.remoteModelPath = 'https://huggingface.co/';
-
-    // Some browser/CDN combinations resolve a stale ONNX runtime path (1.14.0),
-    // which 404s for threaded JSEP assets. Pin a known-good runtime asset path.
-    const onnxBackend = env.backends?.onnx || {};
-    const onnxWasm = onnxBackend.wasm || {};
-    onnxWasm.proxy = false;
-    onnxWasm.numThreads = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)
-      ? Math.min(4, navigator.hardwareConcurrency || 2)
-      : 1;
-    onnxWasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-    onnxBackend.wasm = onnxWasm;
-    env.backends = env.backends || {};
-    env.backends.onnx = onnxBackend;
-
-    let device = 'wasm';
-    try {
-      const testCtx = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
-      if (testCtx) { device = 'webgpu'; privLog('local', '✅ WebGPU detected — GPU-accelerated inference enabled'); }
-      else privLog('info', 'ℹ️ WebGPU not available — using WASM CPU inference (slower but works everywhere)');
-    } catch(e) {
-      privLog('info', 'ℹ️ Using WASM CPU inference');
-    }
-
-    let progressVal = 0;
-    const updateProgress = (pct, msg) => {
-      progressVal = pct;
-      document.getElementById('progress-fill').style.width = pct + '%';
-      document.getElementById('progress-text').textContent = msg;
-    };
+    await configureTransformersEnv();
+    const device = await resolveInferenceDevice();
 
     updateProgress(10, 'Initializing ONNX Runtime…');
 
-    transcriber = await pipeline('automatic-speech-recognition', modelId, {
-      device,
-      progress_callback: (prog) => {
-        if (prog.status === 'progress') {
-          const total = prog.total || prog.progress || 1;
-          const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
-          const pct = Math.min(90, Math.round((loaded / total) * 80) + 10);
-          updateProgress(pct, `Downloading model weights… ${Math.round(loaded / 1024 / 1024)} / ${Math.max(1, Math.round(total / 1024 / 1024))} MB`);
-        } else if (prog.status === 'done') {
-          updateProgress(95, 'Compiling WASM…');
-        }
+    transcriber = await loadAsrPipeline(modelId, device, (prog) => {
+      if (prog.status === 'progress') {
+        const total = prog.total || prog.progress || 1;
+        const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
+        const pct = Math.min(90, Math.round((loaded / total) * 80) + 10);
+        updateProgress(pct, `Downloading model weights… ${Math.round(loaded / 1024 / 1024)} / ${Math.max(1, Math.round(total / 1024 / 1024))} MB`);
+      } else if (prog.status === 'done') {
+        updateProgress(95, 'Compiling WASM…');
       }
     });
 
@@ -948,6 +979,85 @@ window.handleLoadModel = async function() {
     btn.disabled = false;
     document.getElementById('progress-wrap').classList.remove('visible');
     setControlsState();
+  }
+};
+
+window.handleDownloadAllModels = async function() {
+  if (!isSecureEnough()) {
+    setStatus('warning', 'Open via https:// or localhost');
+    privLog('blocked', '🚫 Mic and WebAudio require a secure context. Serve this page over https:// or localhost.');
+    showToast('Serve the page over localhost or HTTPS');
+    return;
+  }
+  if (isListening) {
+    showToast('Stop dictation before downloading all models');
+    return;
+  }
+
+  const selectedModel = getSelectedModelId();
+  const allModels = getAllModelIds();
+  const downloadOrder = [...allModels.filter((id) => id !== selectedModel), selectedModel];
+
+  if (!downloadOrder.length) {
+    showToast('No models configured');
+    return;
+  }
+
+  isBulkDownloading = true;
+  document.getElementById('progress-wrap').classList.add('visible');
+  setControlsState({ loading: true, ready: !!transcriber, listening: false });
+  setStatus('loading', `Downloading all models (0/${downloadOrder.length})…`);
+  privLog('info', `⬇ Download-all started for ${downloadOrder.length} model(s)`);
+
+  try {
+    await configureTransformersEnv();
+    const device = await resolveInferenceDevice();
+
+    for (let i = 0; i < downloadOrder.length; i++) {
+      const modelId = downloadOrder[i];
+      const step = i + 1;
+      const startPct = Math.round((i / downloadOrder.length) * 100);
+      updateProgress(startPct, `Preparing ${step}/${downloadOrder.length}: ${modelId.split('/')[1]}…`);
+      privLog('info', `⬇ [${step}/${downloadOrder.length}] Downloading ${modelId}`);
+
+      const modelPipeline = await loadAsrPipeline(modelId, device, (prog) => {
+        if (prog.status === 'progress') {
+          const total = prog.total || prog.progress || 1;
+          const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
+          const inner = Math.max(0, Math.min(1, loaded / total));
+          const overall = Math.round(((i + inner) / downloadOrder.length) * 100);
+          updateProgress(overall, `Downloading ${step}/${downloadOrder.length}: ${modelId.split('/')[1]} (${Math.round(loaded / 1024 / 1024)} / ${Math.max(1, Math.round(total / 1024 / 1024))} MB)`);
+        } else if (prog.status === 'done') {
+          const overall = Math.round(((i + 0.95) / downloadOrder.length) * 100);
+          updateProgress(overall, `Compiling ${step}/${downloadOrder.length}: ${modelId.split('/')[1]}…`);
+        }
+      });
+
+      const isFinalActiveModel = i === downloadOrder.length - 1;
+      if (isFinalActiveModel) {
+        transcriber = modelPipeline;
+      } else if (typeof modelPipeline?.dispose === 'function') {
+        modelPipeline.dispose();
+      }
+
+      privLog('local', `✅ [${step}/${downloadOrder.length}] Cached ${modelId}`);
+    }
+
+    updateProgress(100, 'All models downloaded and cached');
+    setStatus('ready', `Ready — all ${downloadOrder.length} model(s) cached`);
+    setStage('asr', 'done');
+    showToast('All models downloaded');
+    privLog('local', '✅ Download-all complete — models are available from browser cache');
+    setTimeout(() => document.getElementById('progress-wrap').classList.remove('visible'), 1500);
+    setControlsState({ ready: true, listening: false });
+  } catch (e) {
+    setStatus('', 'Download-all failed — ' + e.message);
+    privLog('warning', '⚠ Download-all error: ' + e.message);
+    document.getElementById('progress-wrap').classList.remove('visible');
+    setControlsState({ ready: !!transcriber, listening: false });
+  } finally {
+    isBulkDownloading = false;
+    setControlsState({ ready: !!transcriber, listening: isListening });
   }
 };
 
