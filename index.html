@@ -798,14 +798,15 @@ async function configureTransformersEnv() {
   env.allowLocalModels = false;
   env.remoteModelPath = 'https://huggingface.co/';
 
-  // Pin ONNX WASM assets to a known-good version to avoid stale CDN path 404s.
+  // Keep ONNX WASM assets aligned with Transformers.js bundled runtime.
+  // Mixing versions can cause ABI errors such as _OrtGetInputName missing.
   const onnxBackend = env.backends?.onnx || {};
   const onnxWasm = onnxBackend.wasm || {};
   onnxWasm.proxy = false;
   onnxWasm.numThreads = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)
     ? Math.min(4, navigator.hardwareConcurrency || 2)
     : 1;
-  onnxWasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+  onnxWasm.wasmPaths = `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${env.version}/dist/`;
   onnxBackend.wasm = onnxWasm;
   env.backends = env.backends || {};
   env.backends.onnx = onnxBackend;
