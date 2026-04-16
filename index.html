@@ -219,6 +219,7 @@
     transition: background var(--transition);
   }
   .status-indicator.loading { background: var(--color-warning); animation: blink 1s ease-in-out infinite; }
+  .status-indicator.warning { background: var(--color-warning); animation: blink 1s ease-in-out infinite; }
   .status-indicator.ready { background: var(--color-success); }
   .status-indicator.listening { background: var(--color-live); animation: blink 0.6s ease-in-out infinite; }
   .status-indicator.processing { background: var(--color-primary); animation: blink 0.8s ease-in-out infinite; }
@@ -527,10 +528,10 @@
             <div class="model-select-group">
               <label for="model-select">Model:</label>
               <select id="model-select" class="model-select">
-                <option value="Xenova/whisper-tiny.en">whisper-tiny.en (~39 MB)</option>
+                <option value="Xenova/whisper-tiny.en" selected>whisper-tiny.en (~39 MB)</option>
                 <option value="Xenova/whisper-base.en">whisper-base.en (~74 MB)</option>
                 <option value="Xenova/whisper-small.en">whisper-small.en (~244 MB)</option>
-                <option value="onnx-community/whisper-tiny.en" selected>whisper-tiny.en WebGPU (~40 MB)</option>
+                <option value="onnx-community/whisper-tiny.en">whisper-tiny.en WebGPU (~40 MB)</option>
               </select>
             </div>
           </div>
@@ -752,11 +753,27 @@ let transcriber = null;
 let micStream = null;
 let audioCtx = null;
 let vadInstance = null;
+let workletNode = null;
+let workletUrl = null;
+let zeroGainNode = null;
 let isListening = false;
+let isTranscribing = false;
+let transcriptionChain = Promise.resolve();
 let utteranceCount = 0;
 let wordCount = 0;
 let lastLatency = null;
 const transcriptEl = document.getElementById('transcript');
+
+function isSecureEnough() {
+  return window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+}
+
+function setControlsState({ loading = false, ready = false, listening = false } = {}) {
+  document.getElementById('btn-load').disabled = loading;
+  document.getElementById('btn-start').disabled = !ready || listening || loading;
+  document.getElementById('btn-stop').disabled = !listening;
+  document.getElementById('btn-copy').disabled = !transcriptEl.textContent.trim();
+}
 
 // ── Privacy Log ────────────────────────────────────────────────────────
 const logEl = document.getElementById('net-log');
@@ -848,6 +865,13 @@ function showToast(msg) {
 
 // ── Load Model ──────────────────────────────────────────────────────────
 window.handleLoadModel = async function() {
+  if (!isSecureEnough()) {
+    setStatus('warning', 'Open via https:// or localhost');
+    privLog('blocked', '🚫 Mic and WebAudio require a secure context. Serve this page over https:// or localhost.');
+    showToast('Serve the page over localhost or HTTPS');
+    return;
+  }
+
   const modelId = document.getElementById('model-select').value;
   const btn = document.getElementById('btn-load');
   btn.disabled = true;
@@ -886,8 +910,10 @@ window.handleLoadModel = async function() {
       device,
       progress_callback: (prog) => {
         if (prog.status === 'progress') {
-          const pct = Math.round((prog.loaded / prog.total) * 80) + 10;
-          updateProgress(pct, `Downloading model weights… ${Math.round(prog.loaded / 1024 / 1024)} / ${Math.round(prog.total / 1024 / 1024)} MB`);
+          const total = prog.total || prog.progress || 1;
+          const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
+          const pct = Math.min(90, Math.round((loaded / total) * 80) + 10);
+          updateProgress(pct, `Downloading model weights… ${Math.round(loaded / 1024 / 1024)} / ${Math.max(1, Math.round(total / 1024 / 1024))} MB`);
         } else if (prog.status === 'done') {
           updateProgress(95, 'Compiling WASM…');
         }
@@ -898,7 +924,7 @@ window.handleLoadModel = async function() {
     setTimeout(() => document.getElementById('progress-wrap').classList.remove('visible'), 1200);
 
     setStatus('ready', `Ready — ${modelId.split('/')[1]}`);
-    document.getElementById('btn-start').disabled = false;
+    setControlsState({ ready: true });
     privLog('local', `✅ Model loaded and cached — runs 100% locally from now on`);
     privLog('local', `✅ After this, you can go offline — dictation still works`);
     showToast('Model loaded — click Start Dictating');
@@ -911,6 +937,7 @@ window.handleLoadModel = async function() {
     privLog('warning', '⚠ Load error: ' + e.message);
     btn.disabled = false;
     document.getElementById('progress-wrap').classList.remove('visible');
+    setControlsState();
   }
 };
 
@@ -929,7 +956,9 @@ class PCMProcessor extends AudioWorkletProcessor {
 }
 registerProcessor('pcm-processor', PCMProcessor);
 `;
-  return URL.createObjectURL(new Blob([code], {type:'application/javascript'}));
+  if (workletUrl) URL.revokeObjectURL(workletUrl);
+  workletUrl = URL.createObjectURL(new Blob([code], {type:'application/javascript'}));
+  return workletUrl;
 }
 
 // ── Start Dictating ──────────────────────────────────────────────────────
@@ -938,9 +967,7 @@ window.handleStart = async function() {
   if (isListening) return;
   isListening = true;
 
-  document.getElementById('btn-start').disabled = true;
-  document.getElementById('btn-stop').disabled = false;
-  document.getElementById('btn-copy').disabled = false;
+  setControlsState({ ready: true, listening: true });
   setStatus('listening', 'Requesting mic…');
 
   // Stage: mic
@@ -959,13 +986,16 @@ window.handleStart = async function() {
     audioCtx = new AudioContext({ sampleRate: 16000 });
     await audioCtx.audioWorklet.addModule(makeWorkletURL());
     const source = audioCtx.createMediaStreamSource(micStream);
-    const workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+    zeroGainNode = audioCtx.createGain();
+    zeroGainNode.gain.value = 0;
 
     workletNode.port.onmessage = (e) => {
       drawWaveform(e.data.pcm);
     };
     source.connect(workletNode);
-    workletNode.connect(audioCtx.destination);
+    workletNode.connect(zeroGainNode);
+    zeroGainNode.connect(audioCtx.destination);
 
     privLog('local', '✅ AudioWorklet running on audio render thread — no network writes');
 
@@ -988,6 +1018,7 @@ window.handleStart = async function() {
         privLog('local', '🎤 VAD: speech detected — accumulating frames locally');
       },
       onSpeechEnd: async (audioFloat32) => {
+        if (!isListening || !transcriber) return;
         document.getElementById('vad-badge').textContent = 'Silence';
         document.getElementById('vad-badge').classList.remove('speech');
         setStage('vad', 'done');
@@ -995,39 +1026,46 @@ window.handleStart = async function() {
         setStatus('processing', 'Transcribing…');
         privLog('local', `🧠 Speech segment (${(audioFloat32.length/16000).toFixed(1)}s) sent to local Whisper — no network call`);
 
-        const t0 = performance.now();
-        try {
-          const result = await transcriber(audioFloat32, {
-            sampling_rate: 16000,
-            language: 'english',
-            task: 'transcribe',
-          });
-          const ms = Math.round(performance.now() - t0);
-          lastLatency = ms;
-          const text = (result.text || '').trim();
+        transcriptionChain = transcriptionChain.then(async () => {
+          if (!isListening || !transcriber) return;
+          if (isTranscribing) return;
+          isTranscribing = true;
+          const t0 = performance.now();
+          try {
+            const result = await transcriber(audioFloat32, {
+              sampling_rate: 16000,
+              language: 'english',
+              task: 'transcribe',
+            });
+            const ms = Math.round(performance.now() - t0);
+            lastLatency = ms;
+            const text = (result.text || '').trim();
 
-          if (text) {
-            // Append to transcript
-            const prevEmpty = transcriptEl.classList.contains('empty');
-            if (prevEmpty) { transcriptEl.classList.remove('empty'); transcriptEl.textContent = ''; }
-            const textNode = document.createTextNode((transcriptEl.textContent ? ' ' : '') + text);
-            transcriptEl.appendChild(textNode);
-            transcriptEl.scrollTop = transcriptEl.scrollHeight;
+            if (text) {
+              const prevEmpty = transcriptEl.classList.contains('empty');
+              if (prevEmpty) { transcriptEl.classList.remove('empty'); transcriptEl.textContent = ''; }
+              const textNode = document.createTextNode((transcriptEl.textContent ? ' ' : '') + text);
+              transcriptEl.appendChild(textNode);
+              transcriptEl.scrollTop = transcriptEl.scrollHeight;
 
-            utteranceCount++;
-            wordCount += text.split(/\s+/).filter(Boolean).length;
-            privLog('local', `✅ Transcribed in ${ms}ms — ${text.length} chars, 0 bytes sent to network`);
+              utteranceCount++;
+              wordCount += text.split(/\s+/).filter(Boolean).length;
+              privLog('local', `✅ Transcribed in ${ms}ms — ${text.length} chars, 0 bytes sent to network`);
+            }
+
+            setStage('asr', 'done');
+            setStage('text', 'active');
+            setTimeout(() => setStage('text', 'done'), 600);
+            setStatus('listening', 'Listening…');
+            updateStats();
+            setControlsState({ ready: true, listening: true });
+          } catch(e) {
+            privLog('warning', '⚠ Transcription error: ' + e.message);
+            setStatus('listening', 'Listening…');
+          } finally {
+            isTranscribing = false;
           }
-
-          setStage('asr', 'done');
-          setStage('text', 'active');
-          setTimeout(() => setStage('text', 'done'), 600);
-          setStatus('listening', 'Listening…');
-          updateStats();
-        } catch(e) {
-          privLog('warning', '⚠ Transcription error: ' + e.message);
-          setStatus('listening', 'Listening…');
-        }
+        });
       }
     });
 
@@ -1039,8 +1077,7 @@ window.handleStart = async function() {
   } catch(e) {
     setStatus('', 'Error: ' + e.message);
     isListening = false;
-    document.getElementById('btn-start').disabled = false;
-    document.getElementById('btn-stop').disabled = true;
+    setControlsState({ ready: !!transcriber });
     privLog('warning', '⚠ ' + e.message);
   }
 };
@@ -1052,14 +1089,15 @@ window.handleStop = function() {
   if (micStream) micStream.getTracks().forEach(t => t.stop());
   if (audioCtx) audioCtx.close();
   micStream = null; audioCtx = null;
+  workletNode = null;
+  zeroGainNode = null;
 
-  document.getElementById('btn-start').disabled = false;
-  document.getElementById('btn-stop').disabled = true;
   document.getElementById('vad-badge').textContent = 'Silence';
   document.getElementById('vad-badge').classList.remove('speech');
   setStatus('ready', 'Stopped — model still loaded');
   privLog('info', '⏹ Dictation stopped. Model remains cached locally.');
   ['mic','worklet','vad','asr','text'].forEach(id => setStage(id, null));
+  setControlsState({ ready: !!transcriber });
 };
 
 // ── Copy ────────────────────────────────────────────────────────────────
@@ -1073,9 +1111,9 @@ window.handleCopy = function() {
 window.handleClear = function() {
   transcriptEl.textContent = '';
   transcriptEl.classList.add('empty');
-  document.getElementById('btn-copy').disabled = true;
   utteranceCount = 0; wordCount = 0; lastLatency = null;
   updateStats();
+  setControlsState({ ready: !!transcriber, listening: isListening });
 };
 
 // ── Theme Toggle ──────────────────────────────────────────────────────────
@@ -1094,6 +1132,13 @@ window.handleClear = function() {
 // ── Init ────────────────────────────────────────────────────────────────
 updateStats();
 drawWaveform(null);
+if (!isSecureEnough()) {
+  setStatus('warning', 'Use localhost or HTTPS');
+  privLog('blocked', '🚫 This demo needs a secure context for microphone access. Open it from localhost or HTTPS.');
+  setControlsState();
+} else {
+  setControlsState();
+}
 </script>
 </body>
 </html>
