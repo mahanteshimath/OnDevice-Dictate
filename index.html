@@ -8,9 +8,6 @@
 <!-- Fonts -->
 <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&f[]=cabinet-grotesk@700,800&display=swap" rel="stylesheet">
 
-<!-- Transformers.js v3 from CDN -->
-<script type="module" src="https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js"></script>
-
 <!-- ONNX Runtime for VAD -->
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
 
@@ -887,6 +884,19 @@ window.handleLoadModel = async function() {
     const { env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3/dist/transformers.min.js');
     env.allowLocalModels = false;
     env.remoteModelPath = 'https://huggingface.co/';
+
+    // Some browser/CDN combinations resolve a stale ONNX runtime path (1.14.0),
+    // which 404s for threaded JSEP assets. Pin a known-good runtime asset path.
+    const onnxBackend = env.backends?.onnx || {};
+    const onnxWasm = onnxBackend.wasm || {};
+    onnxWasm.proxy = false;
+    onnxWasm.numThreads = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)
+      ? Math.min(4, navigator.hardwareConcurrency || 2)
+      : 1;
+    onnxWasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    onnxBackend.wasm = onnxWasm;
+    env.backends = env.backends || {};
+    env.backends.onnx = onnxBackend;
 
     let device = 'wasm';
     try {
