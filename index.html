@@ -838,6 +838,28 @@ async function loadAsrPipeline(modelId, device, onProgress) {
   });
 }
 
+function isWebGpuOnlyModel(modelId) {
+  return modelId.startsWith('onnx-community/');
+}
+
+async function loadAsrPipelineWithFallback(modelId, preferredDevice, onProgress) {
+  try {
+    return await loadAsrPipeline(modelId, preferredDevice, onProgress);
+  } catch (e) {
+    const message = String(e?.message || e || '');
+    const deviceMissing = /requested device not found/i.test(message);
+    if (preferredDevice === 'webgpu' && deviceMissing) {
+      const fallbackModelId = isWebGpuOnlyModel(modelId) ? 'Xenova/whisper-tiny.en' : modelId;
+      privLog('warning', '⚠ WebGPU runtime unavailable. Retrying model load with WASM.');
+      if (fallbackModelId !== modelId) {
+        privLog('warning', `⚠ ${modelId} requires WebGPU. Falling back to ${fallbackModelId}.`);
+      }
+      return loadAsrPipeline(fallbackModelId, 'wasm', onProgress);
+    }
+    throw e;
+  }
+}
+
 // ── Privacy Log ────────────────────────────────────────────────────────
 const logEl = document.getElementById('net-log');
 function privLog(type, msg) {
@@ -935,23 +957,30 @@ window.handleLoadModel = async function() {
     return;
   }
 
-  const modelId = document.getElementById('model-select').value;
+  const selectedModelId = document.getElementById('model-select').value;
   const btn = document.getElementById('btn-load');
   btn.disabled = true;
   document.getElementById('progress-wrap').classList.add('visible');
 
   setStatus('loading', 'Downloading model…');
-  privLog('info', `⬇ Fetching ${modelId} from Hugging Face CDN (model weights only, one-time download)`);
+  privLog('info', `⬇ Fetching ${selectedModelId} from Hugging Face CDN (model weights only, one-time download)`);
   privLog('local', '🔒 Audio pipeline: getUserMedia → AudioWorklet → VAD → WASM Whisper → text');
   privLog('local', '🚫 Zero audio bytes will be sent over the network');
 
   try {
     await configureTransformersEnv();
     const device = await resolveInferenceDevice();
+    let modelId = selectedModelId;
+
+    if (isWebGpuOnlyModel(modelId) && device !== 'webgpu') {
+      modelId = 'Xenova/whisper-tiny.en';
+      privLog('warning', '⚠ Selected model requires WebGPU. Falling back to whisper-tiny.en on WASM.');
+      showToast('WebGPU not available. Loaded whisper-tiny.en instead.');
+    }
 
     updateProgress(10, 'Initializing ONNX Runtime…');
 
-    transcriber = await loadAsrPipeline(modelId, device, (prog) => {
+    transcriber = await loadAsrPipelineWithFallback(modelId, device, (prog) => {
       if (prog.status === 'progress') {
         const total = prog.total || prog.progress || 1;
         const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
@@ -1013,15 +1042,25 @@ window.handleDownloadAllModels = async function() {
   try {
     await configureTransformersEnv();
     const device = await resolveInferenceDevice();
+    let skippedCount = 0;
 
     for (let i = 0; i < downloadOrder.length; i++) {
       const modelId = downloadOrder[i];
       const step = i + 1;
+
+      if (isWebGpuOnlyModel(modelId) && device !== 'webgpu') {
+        skippedCount++;
+        const pct = Math.round(((i + 1) / downloadOrder.length) * 100);
+        updateProgress(pct, `Skipping ${step}/${downloadOrder.length}: ${modelId.split('/')[1]} (WebGPU required)`);
+        privLog('warning', `⚠ Skipped ${modelId}: WebGPU not available on this browser/device.`);
+        continue;
+      }
+
       const startPct = Math.round((i / downloadOrder.length) * 100);
       updateProgress(startPct, `Preparing ${step}/${downloadOrder.length}: ${modelId.split('/')[1]}…`);
       privLog('info', `⬇ [${step}/${downloadOrder.length}] Downloading ${modelId}`);
 
-      const modelPipeline = await loadAsrPipeline(modelId, device, (prog) => {
+      const modelPipeline = await loadAsrPipelineWithFallback(modelId, device, (prog) => {
         if (prog.status === 'progress') {
           const total = prog.total || prog.progress || 1;
           const loaded = prog.loaded || Math.round((prog.progress || 0) * total);
@@ -1045,10 +1084,14 @@ window.handleDownloadAllModels = async function() {
     }
 
     updateProgress(100, 'All models downloaded and cached');
-    setStatus('ready', `Ready — all ${downloadOrder.length} model(s) cached`);
+    const cachedCount = downloadOrder.length - skippedCount;
+    const suffix = skippedCount > 0 ? ` (${skippedCount} skipped: WebGPU required)` : '';
+    setStatus('ready', `Ready — ${cachedCount}/${downloadOrder.length} model(s) cached${suffix}`);
     setStage('asr', 'done');
-    showToast('All models downloaded');
-    privLog('local', '✅ Download-all complete — models are available from browser cache');
+    showToast(skippedCount > 0 ? 'Download complete (some models skipped)' : 'All models downloaded');
+    privLog('local', skippedCount > 0
+      ? `✅ Download-all complete — ${cachedCount} cached, ${skippedCount} skipped (WebGPU required)`
+      : '✅ Download-all complete — models are available from browser cache');
     setTimeout(() => document.getElementById('progress-wrap').classList.remove('visible'), 1500);
     setControlsState({ ready: true, listening: false });
   } catch (e) {
